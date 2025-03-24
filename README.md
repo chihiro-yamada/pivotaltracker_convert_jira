@@ -16,6 +16,8 @@
 - PivotalTrackerからエクスポートしたCSVファイル
 
 ## フォルダ構成
+
+```
 pivotaltojira/
 ├── cmd/                    # コマンドラインツール
 │   ├── all_in_one/         # 一括実行ツール
@@ -39,6 +41,7 @@ pivotaltojira/
 ├── go.mod                  # Go モジュール定義
 ├── go.sum                  # 依存関係のハッシュ
 └── README.md               # このファイル
+```
 
 ## インストール
 
