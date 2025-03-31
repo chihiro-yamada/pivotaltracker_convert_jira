@@ -59,13 +59,6 @@ func (m *MigrationService) ImportIssues() error {
 	defer utils.TrackTime(startTime, "イシューインポート")
 
 	// JIRA CSVを読み込む
-	file, err := os.Open(m.config.JiraCSV)
-	if err != nil {
-		return fmt.Errorf("JIRA CSVファイルオープンエラー: %w", err)
-	}
-	defer file.Close()
-
-	// CSVプロセッサーを使ってCSVレコードを読み込む
 	records, err := m.csvProc.ReadCSV(m.config.JiraCSV)
 	if err != nil {
 		return fmt.Errorf("JIRA CSV読み込みエラー: %w", err)
@@ -77,6 +70,10 @@ func (m *MigrationService) ImportIssues() error {
 	resultMapping := make(models.IssueMapping)
 	var resultMutex sync.Mutex
 
+	// エラーフラグを格納するマップ
+	errorFlags := make(map[string]bool)
+	var errorMutex sync.Mutex
+
 	// セマフォとしてのチャネル（並列数を制限）
 	semaphore := make(chan struct{}, m.config.MaxConcurrent)
 
@@ -85,7 +82,6 @@ func (m *MigrationService) ImportIssues() error {
 
 	// エラー数カウンター
 	errorCount := 0
-	var errorMutex sync.Mutex
 
 	// 各レコードを処理
 	for i, record := range records {
@@ -98,21 +94,34 @@ func (m *MigrationService) ImportIssues() error {
 			defer wg.Done()
 			defer func() { <-semaphore }() // 処理完了時にセマフォからスロットを解放
 
+			// エラーフラグをチェック（前回の実行で失敗したかどうか）
+			if errorFlag, ok := rec["Error"]; ok && errorFlag == "1" {
+				utils.LogInfo("行 %d: 前回失敗したレコードを再処理します", idx+1)
+			}
+
 			// イシュー作成
 			issueKey, err := m.processRecord(rec)
 
 			resultMutex.Lock()
 			defer resultMutex.Unlock()
 
+			pivotalID := rec["JIRA Issue ID"]
 			if err != nil {
 				utils.LogError("行 %d の処理に失敗: %v", idx+1, err)
+
 				errorMutex.Lock()
 				errorCount++
+				errorFlags[pivotalID] = true
 				errorMutex.Unlock()
-				resultMapping[rec["JIRA Issue ID"]] = "ERROR"
+
+				resultMapping[pivotalID] = "ERROR"
 			} else {
 				utils.LogInfo("行 %d の処理が完了: %s", idx+1, issueKey)
-				resultMapping[rec["JIRA Issue ID"]] = issueKey
+				resultMapping[pivotalID] = issueKey
+
+				errorMutex.Lock()
+				errorFlags[pivotalID] = false
+				errorMutex.Unlock()
 			}
 		}(i, record)
 	}
@@ -122,7 +131,7 @@ func (m *MigrationService) ImportIssues() error {
 	close(semaphore)
 
 	// 結果をCSVに書き込む
-	if err := m.csvProc.UpdateJiraKeys(resultMapping); err != nil {
+	if err := m.csvProc.UpdateJiraKeysWithErrorFlags(resultMapping, errorFlags); err != nil {
 		return fmt.Errorf("JIRA キー更新エラー: %w", err)
 	}
 
@@ -138,6 +147,8 @@ func (m *MigrationService) processRecord(record models.CSVRecord) (string, error
 		summary = "No Title"
 	}
 
+	pivotalId := record["JIRA Issue ID"]
+	summary = fmt.Sprintf("[%s] %s", pivotalId, summary)
 	description := record["Description"]
 
 	// ラベルの処理
@@ -149,6 +160,10 @@ func (m *MigrationService) processRecord(record models.CSVRecord) (string, error
 		}
 	}
 
+	// 3. 担当者と報告者の処理
+    reporter := record["Reporter"]
+    assignee := record["Assignee"]
+
 	// イシュータイプの決定
 	issueType := "Task" // デフォルト
 	if recType, ok := record["Type"]; ok && recType != "" {
@@ -156,16 +171,18 @@ func (m *MigrationService) processRecord(record models.CSVRecord) (string, error
 		case "bug":
 			issueType = "Bug"
 		case "feature", "story":
-			issueType = "Story"
+			issueType = "feature"
 		case "chore":
-			issueType = "Task"
-		case "release":
+			issueType = "chore"
+		case "epic":
 			issueType = "Epic"
+		case "release":
+			issueType = "release"
 		}
 	}
 
 	// イシュー作成
-	issueKey, err := m.jiraClient.CreateIssue(summary, description, labels, issueType)
+	issueKey, err := m.jiraClient.CreateIssue(summary, description, labels, issueType, reporter, assignee)
 	if err != nil {
 		return "", fmt.Errorf("イシュー作成エラー: %w", err)
 	}
@@ -185,6 +202,15 @@ func (m *MigrationService) processRecord(record models.CSVRecord) (string, error
 	if status := record["JIRA Status"]; status != "" && status != "Backlog" {
 		if err := m.jiraClient.UpdateStatus(issueKey, status); err != nil {
 			utils.LogWarn("ステータス更新失敗 %s: %v", issueKey, err)
+		}
+	}
+
+	// 3. コメントの追加
+	if comment := record["Comment"]; comment != "" {
+		if err := m.jiraClient.AddComment(issueKey, comment); err != nil {
+			utils.LogWarn("コメント追加失敗 %s: %v", issueKey, err)
+		} else {
+			utils.LogInfo("コメントをイシュー %s に追加しました", issueKey)
 		}
 	}
 

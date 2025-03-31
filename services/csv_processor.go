@@ -36,6 +36,7 @@ func (p *CSVProcessor) ReadPivotalCSV() ([]models.CSVRecord, error) {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1 // フィールド数の不一致を許可
 	records, err := reader.ReadAll()
 	if err != nil {
 		return nil, fmt.Errorf("CSV読み込みエラー: %w", err)
@@ -48,16 +49,55 @@ func (p *CSVProcessor) ReadPivotalCSV() ([]models.CSVRecord, error) {
 	headers := records[0]
 	result := make([]models.CSVRecord, 0, len(records)-1)
 
+	// ヘッダーの重複をチェックし、インデックスを記録
+	headerIndices := make(map[string][]int)
+	for i, header := range headers {
+		headerIndices[header] = append(headerIndices[header], i)
+	}
+
 	for i, record := range records[1:] {
-		if len(record) != len(headers) {
-			utils.LogWarn("行 %d: フィールド数が不一致（ヘッダー: %d, 行: %d）", i+2, len(headers), len(record))
-			continue
+		// フィールド数のチェック
+		if len(record) > len(headers) {
+			return nil, fmt.Errorf("行 %d: フィールド数がヘッダー数より多いです（ヘッダー: %d, 行: %d）", i+2, len(headers), len(record))
+		} else if len(record) < len(headers) {
+			utils.LogWarn("行 %d: フィールド数が不一致（ヘッダー: %d, 行: %d）- 不足分は空にします", i+2, len(headers), len(record))
+			// 不足分を埋める
+			newRecord := make([]string, len(headers))
+			copy(newRecord, record)
+			record = newRecord
 		}
 
 		rowData := make(models.CSVRecord)
-		for j, value := range record {
-			rowData[headers[j]] = value
+
+		// 通常のフィールド処理 (Comment以外)
+		for header, indices := range headerIndices {
+			if header != "Comment" {
+				// 他のカラムは最初のインデックスのみ使用
+				if len(indices) > 0 && indices[0] < len(record) {
+					rowData[header] = record[indices[0]]
+				} else {
+					rowData[header] = ""
+				}
+			}
 		}
+
+		// Commentフィールドの特別処理（結合）
+		if commentIndices, ok := headerIndices["Comment"]; ok && len(commentIndices) > 0 {
+			var comments []string
+			for _, idx := range commentIndices {
+				if idx < len(record) && record[idx] != "" {
+					comments = append(comments, record[idx])
+				}
+			}
+
+			// コメントを区切り線で結合
+			if len(comments) > 0 {
+				rowData["Comment"] = strings.Join(comments, "\n\n===========================\n\n")
+			} else {
+				rowData["Comment"] = ""
+			}
+		}
+
 		result = append(result, rowData)
 	}
 
@@ -74,15 +114,6 @@ func (p *CSVProcessor) ProcessPivotalToJiraCSV(records []models.CSVRecord) ([]mo
 	}
 
 	result := make([]models.CSVRecord, 0, len(records))
-
-	// コメント列の特別な処理を行う（複数の同名列の結合）
-	hasComments := false
-	for _, record := range records {
-		if _, ok := record["Comment"]; ok {
-			hasComments = true
-			break
-		}
-	}
 
 	// PivotalからJIRAへの変換処理
 	for i, record := range records {
@@ -113,12 +144,12 @@ func (p *CSVProcessor) ProcessPivotalToJiraCSV(records []models.CSVRecord) ([]mo
 		// 担当者
 		jiraRecord["Assignee"] = record["Owned By"]
 
-		// コメント処理
-		if hasComments {
-			jiraRecord["Comment"] = record["Comment"]
-		} else {
-			jiraRecord["Comment"] = ""
-		}
+		// 報告者
+		jiraRecord["Reporter"] = record["Requested By"]
+
+		// コメント
+		jiraRecord["Comment"] = record["Comment"]
+
 
 		// JIRA Issue Keyは後で更新
 		jiraRecord["JIRA Issue Key"] = ""
@@ -193,7 +224,7 @@ func (p *CSVProcessor) WriteJiraCSV(records []models.CSVRecord) error {
 	headers := []string{
 		"JIRA Issue ID", "Title", "Description", "Labels", "Type",
 		"JIRA Status", "Story Points", "Created Date", "Resolved Date",
-		"Assignee", "Comment", "JIRA Issue Key",
+		"Assignee", "Reporter", "Comment", "JIRA Issue Key",
 	}
 
 	writer := csv.NewWriter(file)
@@ -337,6 +368,96 @@ func (p *CSVProcessor) UpdateJiraKeys(mapping models.IssueMapping) error {
 	}
 
 	utils.LogInfo("JIRAキーの更新完了: %d/%d 件を更新しました", updated, len(records)-1)
+	return nil
+}
+
+// UpdateJiraKeysWithErrorFlags はCSVファイルのJIRAキーとエラーフラグを更新します
+func (p *CSVProcessor) UpdateJiraKeysWithErrorFlags(mapping models.IssueMapping, errorFlags map[string]bool) error {
+	utils.LogInfo("JIRAキーとエラーフラグをCSVファイルに更新しています...")
+
+	// CSVを読み込む
+	file, err := os.Open(p.config.JiraCSV)
+	if err != nil {
+		return fmt.Errorf("CSVオープンエラー: %w", err)
+	}
+
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	file.Close() // 早めに閉じる
+
+	if err != nil {
+		return fmt.Errorf("CSV読み込みエラー: %w", err)
+	}
+
+	if len(records) < 2 {
+		return fmt.Errorf("更新するデータが不足しています")
+	}
+
+	// ヘッダーの確認と拡張
+	headers := records[0]
+	var idIndex, keyIndex, errorIndex int = -1, -1, -1
+
+	for i, header := range headers {
+		if header == "JIRA Issue ID" {
+			idIndex = i
+		} else if header == "JIRA Issue Key" {
+			keyIndex = i
+		} else if header == "Error" {
+			errorIndex = i
+		}
+	}
+
+	if idIndex == -1 || keyIndex == -1 {
+		return fmt.Errorf("必要なカラムが見つかりません")
+	}
+
+	// Errorカラムがなければ追加
+	if errorIndex == -1 {
+		headers = append(headers, "Error")
+		errorIndex = len(headers) - 1
+
+		// 各行にも空のエラーフィールドを追加
+		for i := range records[1:] {
+			records[i+1] = append(records[i+1], "")
+		}
+	}
+
+	// マッピングを適用
+	updated := 0
+	for i, record := range records[1:] {
+		if len(record) <= max(idIndex, keyIndex) {
+			continue
+		}
+
+		pivotalID := record[idIndex]
+
+		// JIRAキーの更新
+		if jiraKey, ok := mapping[pivotalID]; ok {
+			records[i+1][keyIndex] = jiraKey
+			updated++
+
+			// エラーフラグの更新
+			if errorFlag, ok := errorFlags[pivotalID]; ok && errorFlag {
+				records[i+1][errorIndex] = "1" // エラーあり
+			} else {
+				records[i+1][errorIndex] = "0" // エラーなし
+			}
+		}
+	}
+
+	// 更新したCSVを書き込む
+	outFile, err := os.Create(p.config.JiraCSV)
+	if err != nil {
+		return fmt.Errorf("CSVファイル作成エラー: %w", err)
+	}
+	defer outFile.Close()
+
+	writer := csv.NewWriter(outFile)
+	if err := writer.WriteAll(records); err != nil {
+		return fmt.Errorf("CSV書き込みエラー: %w", err)
+	}
+
+	utils.LogInfo("JIRAキーとエラーフラグの更新完了: %d/%d 件を更新しました", updated, len(records)-1)
 	return nil
 }
 

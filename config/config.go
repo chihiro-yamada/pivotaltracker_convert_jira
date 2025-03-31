@@ -30,10 +30,10 @@ type Config struct {
 var StatusMapping = map[string]string{
 	"unscheduled": "Backlog",
 	"unstarted":   "Backlog",
-	"started":     "IN PROGRESS",
+	"started":     "進行中",
 	"finished":    "REVIEWS",
 	"delivered":   "RELEASED",
-	"accepted":    "ACCEPTED",
+	"accepted":    "受け入れ済み",
 	"rejected":    "Backlog",
 }
 
@@ -48,7 +48,7 @@ func LoadConfig() (*Config, error) {
 		JiraAPIToken:     os.Getenv("JIRA_API_TOKEN"),
 		JiraProjectKey:   os.Getenv("JIRA_PROJECT_KEY"),
 		StoryPointField:  getEnvWithDefault("JIRA_STORY_POINT_FIELD", "customfield_10016"),
-		PivotalCSV:       getEnvWithDefault("PIVOTAL_CSV", "project_history.csv"),
+		PivotalCSV:       getEnvWithDefault("PIVOTAL_CSV", "pivotal.csv"),
 		JiraCSV:          getEnvWithDefault("JIRA_CSV", "jira_import_ready.csv"),
 		AttachmentsFolder: getEnvWithDefault("ATTACHMENTS_FOLDER", "attachments"),
 		MaxConcurrent:    getEnvAsIntWithDefault("MAX_CONCURRENT", 10),
